@@ -1,0 +1,4 @@
+# <output path glob> <mode>: first match wins. Allowed modes: 600, 640, 644.
+# Default when nothing matches: 600 for files named .env*, otherwise 644.
+cloudflared/*      644
+fail2ban/*         644

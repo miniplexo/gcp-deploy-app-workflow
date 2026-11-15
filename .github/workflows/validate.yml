@@ -1,0 +1,25 @@
+# Reusable workflow: check every app of an instance repo without any secrets (use it on pull requests).
+name: validate
+on:
+  workflow_call:
+    inputs:
+      shared_repository: { required: true, type: string }   # e.g. my-org/deploy
+      shared_ref:        { required: true, type: string }   # same tag or commit as in the caller's `uses:` line
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@v4            # pin to a commit SHA in real use
+        with: { path: instance, persist-credentials: false }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.shared_repository }}
+          ref: ${{ inputs.shared_ref }}
+          path: shared
+          persist-credentials: false
+      - name: Render every app (dry run, no secrets)
+        run: python3 -I shared/scripts/render.py --instance instance --all --dry-run

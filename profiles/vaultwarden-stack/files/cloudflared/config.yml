@@ -1,0 +1,2 @@
+tunnel: ${CF_TUNNEL_NAME}
+credentials-file: /etc/cloudflared/vault-tunnel-cred.json

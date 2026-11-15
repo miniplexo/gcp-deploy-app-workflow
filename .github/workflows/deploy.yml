@@ -1,0 +1,110 @@
+# Reusable workflow: render one app of the calling instance repo and deploy it to its VM over IAP SSH.
+# Draft: not run on GitHub yet. Pin third-party actions to commit SHAs in real use.
+name: deploy-app
+on:
+  workflow_call:
+    inputs:
+      app:               { required: true,  type: string }                      # folder name under apps/
+      shared_repository: { required: true,  type: string }                      # e.g. my-org/deploy
+      shared_ref:        { required: true,  type: string }                      # same tag or commit as in the caller's `uses:` line
+      environment:       { required: false, type: string,  default: production } # GitHub Environment holding secrets and variables
+      adopt:             { required: false, type: boolean, default: false }     # take over an existing folder that has no .owner file
+    # secrets: the caller passes `secrets: inherit`
+
+permissions: {}
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 20
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: instance, persist-credentials: false }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.shared_repository }}
+          ref: ${{ inputs.shared_ref }}
+          path: shared
+          persist-credentials: false
+
+      - name: Read the VM settings (validated, never secret)
+        id: vm
+        env: { APP: "${{ inputs.app }}" }
+        run: |
+          set -euo pipefail
+          get() { python3 -I shared/scripts/render.py --instance instance --app "$APP" --get "$1"; }
+          { echo "vm=$(get VM_NAME)"; echo "zone=$(get GCP_ZONE)"; echo "root=$(get APPS_ROOT)"; } >> "$GITHUB_OUTPUT"
+
+      - name: Render the bundle
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}      # only this step sees the secrets
+          APP: ${{ inputs.app }}
+        run: python3 -I shared/scripts/render.py --instance instance --app "$APP" --out "$RUNNER_TEMP/bundle" --mask
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build the remote script (apply-config.sh and the bundle travel on stdin, never on a command line)
+        env:
+          APP: ${{ inputs.app }}
+          ROOT: ${{ steps.vm.outputs.root }}
+          OWNER: ${{ github.repository }}
+          ADOPT: ${{ inputs.adopt && '--adopt' || '' }}
+        run: |
+          set -euo pipefail
+          m="END_$(openssl rand -hex 12)"
+          out="$RUNNER_TEMP/remote.sh"
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'set -euo pipefail'
+            echo 'exec 9>/run/lock/apps-deploy.lock; flock 9          # one deployment at a time per VM'
+            echo 'd="$(mktemp -d)"; trap '"'"'rm -rf "$d"'"'"' EXIT'
+            echo "cat >\"\$d/apply-config.sh\" <<'$m'"; cat shared/scripts/apply-config.sh; echo "$m"
+            echo "cat >\"\$d/bundle\" <<'$m'";           cat "$RUNNER_TEMP/bundle";           echo "$m"
+            printf 'bash "$d/apply-config.sh" "$d/bundle" --apps-root %q --app %q --owner %q %s\n' "$ROOT" "$APP" "$OWNER" "$ADOPT"
+            printf 'cd %q/%q\n' "$ROOT" "$APP"
+            cat <<'TAIL'
+          found=0; for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do [ -f "$f" ] && found=1; done
+          if [ "$found" = 1 ]; then
+            docker compose -p "$(basename "$PWD")" up -d --remove-orphans
+            for i in $(seq 1 20); do
+              bad="$(docker compose -p "$(basename "$PWD")" ps -a --format '{{.Name}} {{.State}}' | awk '$2!="running"{print $1}')"
+              [ -z "$bad" ] && break; sleep 3
+            done
+            [ -z "$bad" ] || { echo "containers not running: $bad" >&2; exit 1; }
+          fi
+          TAIL
+          } > "$out"
+          chmod 600 "$out"
+
+      - name: Deploy over IAP SSH
+        env:
+          VM: ${{ steps.vm.outputs.vm }}
+          ZONE: ${{ steps.vm.outputs.zone }}
+        run: |
+          gcloud compute ssh "$VM" --zone "$ZONE" --tunnel-through-iap --quiet \
+            --command "sudo bash -s" < "$RUNNER_TEMP/remote.sh"
+
+      - name: Record what was deployed (no values)
+        if: success()
+        env: { APP: "${{ inputs.app }}" }
+        run: |
+          {
+            echo "### Deployed \`$APP\`"
+            echo "- instance repo commit: \`$GITHUB_SHA\`"
+            echo "- shared repo ref: \`${{ inputs.shared_ref }}\`"
+            echo "- bundle fingerprint: \`$(sha256sum "$RUNNER_TEMP/bundle" | cut -c1-16)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the bundle from the runner
+        if: always()
+        run: shred -u "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/remote.sh" 2>/dev/null || rm -f "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/remote.sh"

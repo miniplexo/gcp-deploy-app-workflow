@@ -1,0 +1,7 @@
+# <output path glob> <regex>: every substituted value in a matching output file must match the regex (full match).
+# Used where a value lands inside a shell command, a parsed config file, or is sourced by a script.
+deploy-ids.env                          ^[0-9]{1,10}$
+gitconfig.sh                            ^[^\x00-\x1f\x7f]{1,200}$
+fail2ban/jail.d/jail.local              ^[A-Za-z0-9._+@,: /-]{1,200}$
+fail2ban/action.d/cloudflare-iplist.conf   ^[A-Za-z0-9._-]{1,200}$
+fail2ban/action.d/smtp-direct.conf      ^[A-Za-z0-9._~+@,: -]{1,200}$
